@@ -112,6 +112,7 @@ import { SessionTerminalsProvider } from "./context/session-terminals"
 import { ClientMcp } from "./context/client-mcp"
 import { PanelProvider, usePanel } from "./context/panel"
 import { SessionFrame } from "./component/session-frame"
+import { SessionTranscript } from "./routes/session/transcript"
 import { createTuiClipboard } from "./clipboard"
 
 const appGlobalBindingCommands = ["session.list", "session.new", "open.menu", "terminal.suspend"] as const
@@ -434,6 +435,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                                                               <PluginProvider
                                                                                 packages={input.packages}
                                                                                 directories={pluginDirectories}
+                                                                                sessionTranscript={SessionTranscript}
                                                                               >
                                                                                 <App />
                                                                               </PluginProvider>
