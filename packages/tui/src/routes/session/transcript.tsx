@@ -13,6 +13,7 @@ import { useToast } from "../../ui/toast"
 import { getScrollAcceleration } from "../../util/scroll"
 import { createSingleFlight } from "../../util/single-flight"
 import { createTimelineAnchors, groupID } from "./anchors"
+import { findBoundaryCollapseGroup, type BoundaryCollapseMode } from "./boundary-collapse"
 import { defaultVerbosity } from "./grouping/session"
 import { SessionRowView } from "./index"
 import { context, type PendingAction, type RenderContext } from "./render-context"
@@ -39,9 +40,15 @@ function Transcript(props: SessionTranscriptInput) {
   const theme = useTheme()
   const toast = useToast()
   const [away, setAway] = createSignal(false)
+  const [boundaryCollapseID, setBoundaryCollapseID] = createSignal<string>()
+  const [collapseHovered, setCollapseHovered] = createSignal(false)
   const [scroll, setScroll] = createSignal<ScrollBoxRenderable>()
   const showScrollbar = () => config.session?.scrollbar ?? false
+  const boundaryCollapseMode = (): BoundaryCollapseMode => config.session?.boundary_collapse ?? "overflow"
   const scrollAcceleration = createMemo(() => getScrollAcceleration(config))
+  createEffect(() => {
+    if (!boundaryCollapseID()) setCollapseHovered(false)
+  })
 
   const anchors = createTimelineAnchors()
   const rows = createSessionRows(() => sessionID, undefined, pinAbove)
@@ -117,10 +124,59 @@ function Transcript(props: SessionTranscriptInput) {
     ],
   }))
 
+  const groupExpanded: RenderContext["groupExpanded"] = (id, kind) =>
+    tabs.groupExpanded(sessionID, id) ??
+    ((config.session?.verbosity ?? defaultVerbosity) === "high" &&
+      (kind === "exploration" || kind === "instructions"))
+
+  function updateBoundaryCollapse() {
+    const view = scroll()
+    if (!view || view.isDestroyed) {
+      setBoundaryCollapseID(undefined)
+      return
+    }
+    const target = findBoundaryCollapseGroup({
+      mode: boundaryCollapseMode(),
+      viewportTop: view.viewport.y,
+      viewportHeight: view.viewport.height,
+      anchors: anchors.list(),
+      isExpanded: groupExpanded,
+    })
+    setBoundaryCollapseID(target?.groupID)
+  }
+
+  function collapseBoundaryGroup() {
+    if (renderer.getSelection()?.getSelectedText()) return
+    const id = boundaryCollapseID()
+    const view = scroll()
+    if (!id || !view || view.isDestroyed) return
+    const current = anchors.get({ type: "group", groupID: id })
+    const headerVisible = current !== undefined && current.node.y >= view.viewport.y
+    const previousScreenY = current ? current.node.y - view.viewport.y : undefined
+    tabs.setGroupExpanded(sessionID, id, false)
+    view.afterLayout(() => {
+      if (view.isDestroyed) return
+      const next = anchors.get({ type: "group", groupID: id })
+      if (next) {
+        const contentY = view.scrollTop + next.node.y - view.viewport.y
+        const desiredScreenY = headerVisible && previousScreenY !== undefined ? previousScreenY : 1
+        view.scrollTo(Math.max(0, contentY - desiredScreenY))
+      }
+      updateAway()
+    })
+  }
+
+  createEffect(() => {
+    boundaryCollapseMode()
+    const view = scroll()
+    if (view && !view.isDestroyed) view.afterLayout(updateBoundaryCollapse)
+  })
+
   function updateAway() {
     const view = scroll()
     if (!view || view.isDestroyed) return
     setAway(view.scrollTop < view.scrollHeight - view.viewport.height)
+    updateBoundaryCollapse()
   }
 
   function pinAbove() {
@@ -141,16 +197,14 @@ function Transcript(props: SessionTranscriptInput) {
     },
     sessionID,
     anchors,
-    groupExpanded: (id, kind) =>
-      tabs.groupExpanded(sessionID, id) ??
-      ((config.session?.verbosity ?? defaultVerbosity) === "high" &&
-        (kind === "exploration" || kind === "instructions")),
+    groupExpanded,
     setGroupExpanded: (id, expanded, anchor) => {
       const last = rows.findLast((row) => row.type !== "assistant-footer" && row.type !== "turn-usage")
       const ending = last?.type === "group" && groupID(last, 0) === id
       const view = scroll()
       if (view && anchor && (away() || !ending)) view.afterLayout(view.anchor(anchor))
       tabs.setGroupExpanded(sessionID, id, expanded)
+      if (view && !view.isDestroyed) view.afterLayout(updateAway)
     },
     thinkingMode: () => config.session?.thinking ?? "hide",
     markdownMode: () => config.session?.markdown ?? "rendered",
@@ -212,14 +266,34 @@ function Transcript(props: SessionTranscriptInput) {
             {(row, index) => <SessionRowView row={row} message={message} boundaryID={boundaries()[index()]} />}
           </For>
         </scrollbox>
-        <box height={1} flexShrink={0} flexDirection="row" justifyContent="flex-end">
-          <Show when={away()}>
-            <box onMouseUp={jumpToLatest}>
-              <text fg={theme.text.action.secondary.base} selectable={false}>
-                Jump to latest ↓
-              </text>
-            </box>
-          </Show>
+        <box height={1} flexShrink={0} flexDirection="row" justifyContent="space-between">
+          <box flexDirection="row" flexShrink={0}>
+            <Show when={boundaryCollapseID()}>
+              <box
+                id="transcript-boundary-collapse"
+                paddingRight={1}
+                onMouseOver={() => setCollapseHovered(true)}
+                onMouseOut={() => setCollapseHovered(false)}
+                onMouseUp={collapseBoundaryGroup}
+              >
+                <text
+                  fg={collapseHovered() ? theme.text.action.secondary.hovered : theme.text.action.secondary.base}
+                  selectable={false}
+                >
+                  − Collapse
+                </text>
+              </box>
+            </Show>
+          </box>
+          <box flexDirection="row" flexShrink={0}>
+            <Show when={away()}>
+              <box onMouseUp={jumpToLatest}>
+                <text fg={theme.text.action.secondary.base} selectable={false}>
+                  Jump to latest ↓
+                </text>
+              </box>
+            </Show>
+          </box>
         </box>
       </box>
     </context.Provider>
