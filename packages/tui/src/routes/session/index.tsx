@@ -1569,6 +1569,7 @@ export function Session(props: {
                 <Show when={!firstJump() && boundaryCollapseID()}>
                   <box
                     id="session-boundary-collapse"
+                    paddingLeft={3}
                     paddingRight={1}
                     onMouseOver={() => setCollapseHovered(true)}
                     onMouseOut={() => setCollapseHovered(false)}
