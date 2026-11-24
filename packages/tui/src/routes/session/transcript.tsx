@@ -2,7 +2,6 @@ import type { SessionTranscriptInput } from "@opencode/plugin/tui/context"
 import { MouseButton, type ScrollBoxRenderable } from "@opentui/core"
 import { useRenderer, useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
-import { SessionTurn } from "@opencode/util/session-turn"
 import { useConfig } from "../../config"
 import { useClient } from "../../context/client"
 import { useData } from "../../context/data"
@@ -11,13 +10,12 @@ import { useSessionTabs } from "../../context/session-tabs"
 import { useTheme } from "../../context/theme"
 import { useToast } from "../../ui/toast"
 import { getScrollAcceleration } from "../../util/scroll"
-import { createSingleFlight } from "../../util/single-flight"
-import { createTimelineAnchors, groupID } from "./anchors"
+import { createTimelineAnchors } from "./anchors"
 import { findBoundaryCollapseGroup, type BoundaryCollapseMode } from "./boundary-collapse"
-import { defaultVerbosity } from "./grouping/session"
 import { SessionRowView } from "./index"
-import { context, type PendingAction, type RenderContext } from "./render-context"
-import { completeGroupBoundary, createSessionRows, messageBoundaryIDs } from "./rows"
+import { context } from "./render-context"
+import { createSessionRows, messageBoundaryIDs } from "./rows"
+import { createPendingInbox, createRenderContext, loadOlderMessages, pinScrollAbove } from "./shared"
 
 export function SessionTranscript(props: SessionTranscriptInput) {
   return (
@@ -50,18 +48,13 @@ function Transcript(props: SessionTranscriptInput) {
     if (!boundaryCollapseID()) setCollapseHovered(false)
   })
 
+  const pinAbove = () => pinScrollAbove(scroll, "transcript-older")
   const anchors = createTimelineAnchors()
   const rows = createSessionRows(() => sessionID, undefined, pinAbove)
   const messages = () => data.session.message.list(sessionID)
-  const indexes = createMemo(() => new Map(messages().map((message, index) => [message.id, index])))
   const message = (messageID: string) => data.session.message.get(sessionID, messageID)
   const boundaries = createMemo(() => messageBoundaryIDs(rows, messages()))
-  const legacyTurns = createMemo(() => SessionTurn.legacy(messages()))
-  const pending = createMemo(
-    () => new Map(data.session.pending.list(sessionID).map((item) => [item.id, item.delivery])),
-  )
   const location = () => data.session.get(sessionID)?.location
-  const models = createMemo(() => data.location.model.list(location()) ?? [])
   createEffect(() => {
     if (client.connection.status() !== "connected") return
     void data.session.sync(sessionID).catch(() => undefined)
@@ -73,38 +66,21 @@ function Transcript(props: SessionTranscriptInput) {
     if (ref) void data.location.model.sync(ref).catch(() => undefined)
   })
 
-  const runPendingAction = createSingleFlight<string>()
-  const mutatePending = async (action: PendingAction, inboxID: string) =>
-    (await runPendingAction(inboxID, async () => {
-      const request =
-        action === "cancel"
-          ? client.api.session.inbox.cancel({ sessionID, inboxID })
-          : client.api.session.inbox.update({ sessionID, inboxID, delivery: action })
-      return request.then(
-        () => true,
-        (error) => {
-          toast.error(error)
-          return false
-        },
-      )
-    })) ?? false
+  const pendingInbox = createPendingInbox(sessionID)
 
   const more = () => data.session.message.more(sessionID)
   const history = new AbortController()
   onCleanup(() => history.abort())
   function loadOlder() {
     if (!more() || data.session.message.loading(sessionID)) return
-    const loadMore = () => data.session.message.loadMore(sessionID, { signal: history.signal, beforePublish: pinAbove })
-    void (async () => {
-      await loadMore()
-      await completeGroupBoundary({
-        rows,
-        messages: () => messages().length,
-        more,
-        loadMore,
-        active: () => !history.signal.aborted,
-      })
-    })().catch(toast.error)
+    void loadOlderMessages({
+      sessionID,
+      messages: data.session.message,
+      rows,
+      signal: history.signal,
+      beforePublish: pinAbove,
+      active: () => !history.signal.aborted,
+    }).catch(toast.error)
   }
 
   const jumpToLatest = () => scroll()?.scrollTo(Infinity)
@@ -124,10 +100,21 @@ function Transcript(props: SessionTranscriptInput) {
     ],
   }))
 
-  const groupExpanded: RenderContext["groupExpanded"] = (id, kind) =>
-    tabs.groupExpanded(sessionID, id) ??
-    ((config.session?.verbosity ?? defaultVerbosity) === "high" &&
-      (kind === "exploration" || kind === "instructions"))
+  const renderContext = createRenderContext({
+    sessionID,
+    rows,
+    anchors,
+    scroll,
+    away,
+    width: () => Math.max(1, (props.width ?? terminal().width) - (showScrollbar() ? 2 : 0)),
+    location,
+    mutatePending: pendingInbox.mutate,
+    onGroupToggle: () => {
+      const view = scroll()
+      if (view && !view.isDestroyed) view.afterLayout(updateAway)
+    },
+    openSession: () => props.onOpenSession,
+  })
 
   function updateBoundaryCollapse() {
     const view = scroll()
@@ -140,7 +127,7 @@ function Transcript(props: SessionTranscriptInput) {
       viewportTop: view.viewport.y,
       viewportHeight: view.viewport.height,
       anchors: anchors.list(),
-      isExpanded: groupExpanded,
+      isExpanded: renderContext.groupExpanded,
     })
     setBoundaryCollapseID(target?.groupID)
   }
@@ -177,48 +164,6 @@ function Transcript(props: SessionTranscriptInput) {
     if (!view || view.isDestroyed) return
     setAway(view.scrollTop < view.scrollHeight - view.viewport.height)
     updateBoundaryCollapse()
-  }
-
-  function pinAbove() {
-    const view = scroll()
-    if (!view || view.isDestroyed || view.scrollTop >= view.scrollHeight - view.viewport.height) return
-    const row = view
-      .getChildren()
-      .find((node) => node.id !== "transcript-older" && node.height > 0 && node.y + node.height > view.viewport.y)
-    if (row) view.afterLayout(view.anchor(row))
-  }
-
-  const renderContext: RenderContext = {
-    get width() {
-      return Math.max(1, (props.width ?? terminal().width) - (showScrollbar() ? 2 : 0))
-    },
-    get terminal() {
-      return terminal()
-    },
-    sessionID,
-    anchors,
-    groupExpanded,
-    setGroupExpanded: (id, expanded, anchor) => {
-      const last = rows.findLast((row) => row.type !== "assistant-footer" && row.type !== "turn-usage")
-      const ending = last?.type === "group" && groupID(last, 0) === id
-      const view = scroll()
-      if (view && anchor && (away() || !ending)) view.afterLayout(view.anchor(anchor))
-      tabs.setGroupExpanded(sessionID, id, expanded)
-      if (view && !view.isDestroyed) view.afterLayout(updateAway)
-    },
-    thinkingMode: () => config.session?.thinking ?? "hide",
-    markdownMode: () => config.session?.markdown ?? "rendered",
-    groupExploration: () => config.session?.grouping !== "none",
-    diffWrapMode: () => config.diffs?.wrap ?? "word",
-    models,
-    messageIndex: (id) => indexes().get(id),
-    legacyTurns,
-    config,
-    mutatePending,
-    pendingDelivery: (id) => pending().get(id),
-    get openSession() {
-      return props.onOpenSession
-    },
   }
 
   return (
