@@ -216,6 +216,7 @@ function Transcript(props: SessionTranscriptInput) {
             <Show when={boundaryCollapseID()}>
               <box
                 id="transcript-boundary-collapse"
+                paddingLeft={3}
                 paddingRight={1}
                 onMouseOver={() => setCollapseHovered(true)}
                 onMouseOut={() => setCollapseHovered(false)}
